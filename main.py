@@ -7,16 +7,51 @@ import os
 import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
+import sys
 
-# ==================== 配置区（固定不变） ====================
+# ==================== 配置区 ====================
 API_KEY: str = "73970210142d48bbb8515da1a730487b"
 BASE_URL: str = "https://open.steamdt.com/open/cs2/v1"
 HEADERS: Dict[str, str] = {
     "Authorization": f"Bearer {API_KEY}",
     "Content-Type": "application/json"
 }
-CACHE_FILE: str = "steam_items_cache.json"
-MONITOR_CONFIG_FILE: str = "steam_price_monitor.json"
+
+# ==================== 打包兼容路径函数（关键修改） ====================
+def get_resource_path(filename: str) -> str:
+    """
+    获取资源文件路径（兼容打包后的 exe）
+    打包文件读取临时目录，运行时缓存写入 exe 同目录
+    """
+    if getattr(sys, 'frozen', False):
+        # 打包后的 exe 环境
+        base_path = os.path.dirname(sys.executable)
+        # 打包的数据文件在临时目录
+        temp_path = getattr(sys, '_MEIPASS', base_path)
+        # 优先返回临时目录的打包文件路径
+        packed_file = os.path.join(temp_path, filename)
+        if os.path.exists(packed_file):
+            return packed_file
+        # 否则返回 exe 同目录（运行时缓存）
+        return os.path.join(base_path, filename)
+    else:
+        # 开发环境 - 使用脚本所在目录
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+def get_cache_path(filename: str) -> str:
+    """
+    获取缓存文件写入路径（始终是 exe 同目录，可写）
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), filename)
+    else:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+# 打包数据文件（只读）
+PACKED_CACHE_FILE: str = get_resource_path("steam_items_cache.json")
+# 运行时缓存文件（可写）
+CACHE_FILE: str = get_cache_path("steam_items_cache.json")
+MONITOR_CONFIG_FILE: str = get_cache_path("steam_price_monitor.json")
 CACHE_EXPIRE_HOURS: int = 24
 DEFAULT_REFRESH_INTERVAL: int = 300
 
@@ -66,7 +101,7 @@ WEAPON_TYPE_MAP: Dict[str, str] = {
     # 刀具
     "Karambit": "刀具", "爪子刀": "刀具", "爪刀": "刀具",
     "Butterfly Knife": "刀具", "蝴蝶刀": "刀具",
-    "M9 Bayonet": "刀具", "M9刺刀": "刀具",
+    "M9 Bayonet": "刀具", "M9 刺刀": "刀具",
     "Bayonet": "刀具", "刺刀": "刀具",
     "Flip Knife": "刀具", "折叠刀": "刀具",
     "Gut Knife": "刀具", "穿肠刀": "刀具",
@@ -105,56 +140,88 @@ WEAPON_TYPE_MAP: Dict[str, str] = {
     "Souvenir": "纪念品",
     "StatTrak": "暗金",
 }
-# CS2固定磨损档位
+
 WEAR_LEVEL_LIST: List[str] = ["全部", "崭新出厂", "略有磨损", "久经沙场", "破损不堪", "战痕累累"]
-# 磨损正则匹配
-WEAR_PATTERN = re.compile(r"\((崭新出厂|略有磨损|久经沙场|破损不堪|战痕累累)\)$")
-# 饰品名武器前缀提取正则
+WEAR_PATTERN = re.compile(r"((崭新出厂 | 略有磨损 | 久经沙场 | 破损不堪 | 战痕累累))$")
 WEAPON_NAME_PATTERN = re.compile(r"^(.+?)\s*\|")
 
-# ==================== 核心函数（严格匹配官方接口规范） ====================
-def get_steam_items() -> Optional[List[Dict[str, Any]]]:
-    """获取Steam CS2饰品基础信息（每日仅1次，带本地缓存）"""
+
+# ==================== 核心函数（支持打包数据 + 更新按钮） ====================
+def get_steam_items(force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+    """
+    获取 Steam CS2 饰品基础信息
+    优先级：1.运行时缓存  2.打包数据  3.API 请求
+    """
+    cache_data = None
+    cache_valid = False
+    
+    # 1. 优先读取运行时缓存（exe 同目录，可写）
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cache_data: Dict[str, Any] = json.load(f)
-            cache_time: datetime = datetime.fromisoformat(cache_data["cache_time"])
-            if datetime.now() - cache_time < timedelta(hours=CACHE_EXPIRE_HOURS):
-                print("✅ 使用缓存的饰品基础信息")
-                return cache_data["data"]
+                cache_data = json.load(f)
+                cache_time = datetime.fromisoformat(cache_data["cache_time"])
+                if datetime.now() - cache_time < timedelta(hours=CACHE_EXPIRE_HOURS):
+                    cache_valid = True
+                    print(f"✅ 使用运行时缓存")
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"⚠️  缓存文件损坏，将重新请求: {str(e)}")
+            print(f"⚠️ 运行时缓存损坏：{str(e)}")
+            cache_data = None
+    
+    # 2. 其次读取打包数据（只读，作为默认数据）
+    if not cache_valid and os.path.exists(PACKED_CACHE_FILE):
+        try:
+            with open(PACKED_CACHE_FILE, "r", encoding="utf-8") as f:
+                packed_data = json.load(f)
+                print(f"✅ 使用打包的默认饰品数据")
+                return packed_data.get("data", [])
+        except Exception as e:
+            print(f"⚠️ 打包数据读取失败：{str(e)}")
+    
+    # 3. 最后尝试 API 请求
+    if force_refresh or not cache_valid:
+        print("🔄 正在请求最新饰品数据...")
+        try:
+            response = requests.get(f"{BASE_URL}/base", headers=HEADERS, timeout=15)
+            response.raise_for_status()
+            api_data = response.json()
 
-    try:
-        response = requests.get(f"{BASE_URL}/base", headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        api_data = response.json()
-
-        if api_data.get("success"):
-            cache_data = {
-                "cache_time": datetime.now().isoformat(),
-                "data": api_data["data"]
-            }
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
-            print("✅ 饰品基础信息请求成功并缓存")
-            return api_data["data"]
-        else:
-            print(f"❌ 基础信息请求失败: {api_data.get('errorMsg', '未知错误')}")
-            return None
-    except Exception as e:
-        print(f"❌ 获取饰品基础信息失败: {str(e)}")
+            if api_data.get("success"):
+                # 更新运行时缓存
+                new_cache_data = {
+                    "cache_time": datetime.now().isoformat(),
+                    "data": api_data["data"]
+                }
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(new_cache_data, f, ensure_ascii=False, indent=2)
+                print(f"✅ 饰品数据更新成功，共 {len(api_data['data'])} 个饰品")
+                return api_data["data"]
+            else:
+                print(f"❌ API 请求失败：{api_data.get('errorMsg', '未知错误')}")
+        except Exception as e:
+            print(f"❌ 网络请求失败：{str(e)}")
+        
+        # API 失败但有打包数据，使用打包数据
+        if os.path.exists(PACKED_CACHE_FILE):
+            try:
+                with open(PACKED_CACHE_FILE, "r", encoding="utf-8") as f:
+                    packed_data = json.load(f)
+                    print("⚠️ 使用打包的默认数据（API 请求失败）")
+                    return packed_data.get("data", [])
+            except:
+                pass
+        
         return None
+    
+    return cache_data.get("data", []) if cache_data else None
+
 
 # ==================== 分类解析核心函数 ====================
 def parse_item_info(item_name: str) -> Tuple[str, str]:
-    """解析饰品名称，返回(武器类型, 磨损度)，精准匹配前缀避免误判"""
-    # 解析磨损度
+    """解析饰品名称，返回 (武器类型，磨损度)"""
     wear_match = WEAR_PATTERN.search(item_name)
     wear_level = wear_match.group(1) if wear_match else "无磨损"
-
-    # 优先提取|前的武器前缀，精准匹配
+    
     weapon_type = "其他"
     weapon_match = WEAPON_NAME_PATTERN.match(item_name)
     if weapon_match:
@@ -164,7 +231,6 @@ def parse_item_info(item_name: str) -> Tuple[str, str]:
                 weapon_type = type_name
                 break
     else:
-        # 无|的饰品（箱子/贴纸等）全名称匹配
         for weapon_key, type_name in WEAPON_TYPE_MAP.items():
             if weapon_key in item_name:
                 weapon_type = type_name
@@ -172,17 +238,19 @@ def parse_item_info(item_name: str) -> Tuple[str, str]:
 
     return weapon_type, wear_level
 
+
 def init_item_classify_data(item_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """给饰品列表预添加分类和磨损字段，加速后续筛选"""
+    """给饰品列表预添加分类和磨损字段"""
     classified_list = []
     for item in item_list:
-        item_name = item.get("name", "")
+        item_name = item.get("name", " ")
         weapon_type, wear_level = parse_item_info(item_name)
         classified_item = item.copy()
         classified_item["weapon_type"] = weapon_type
         classified_item["wear_level"] = wear_level
         classified_list.append(classified_item)
     return classified_list
+
 
 def filter_items(
     item_list: List[Dict[str, Any]],
@@ -192,22 +260,19 @@ def filter_items(
 ) -> List[Dict[str, Any]]:
     """多条件筛选饰品"""
     filtered = item_list.copy()
-
     if weapon_type != "全部":
         filtered = [item for item in filtered if item["weapon_type"] == weapon_type]
-
     if wear_level != "全部":
         filtered = [item for item in filtered if item["wear_level"] == wear_level]
-
     if keyword.strip():
         keyword = keyword.strip().lower()
         filtered = [item for item in filtered if keyword in item["name"].lower()]
-
     return filtered
+
 
 # ==================== 原有核心函数 ====================
 def cn_to_market_hash(items: List[Dict[str, Any]], chinese_name: str) -> Optional[str]:
-    """中文饰品名 → 官方marketHashName（精确匹配）"""
+    """中文饰品名 → 官方 marketHashName"""
     if not items or not chinese_name:
         return None
     for item in items:
@@ -215,11 +280,11 @@ def cn_to_market_hash(items: List[Dict[str, Any]], chinese_name: str) -> Optiona
             return item.get("marketHashName")
     return None
 
+
 def get_single_item_price(market_hash_name: str) -> Optional[List[Dict[str, Any]]]:
     """单饰品价格查询"""
     if not market_hash_name:
         return None
-
     params = {"marketHashName": market_hash_name}
     try:
         response = requests.get(
@@ -230,37 +295,34 @@ def get_single_item_price(market_hash_name: str) -> Optional[List[Dict[str, Any]
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            error_msg = api_data.get('errorMsg', '未知错误')
-            print(f"❌ 价格查询失败: {error_msg}")
+            print(f"❌ 价格查询失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 网络请求失败: {str(e)}")
+        print(f"❌ 网络请求失败：{str(e)}")
         return None
+
 
 def get_item_min_price(market_hash_name: str) -> Optional[float]:
     """获取饰品全网最低售价"""
     price_list = get_single_item_price(market_hash_name)
     if not price_list:
         return None
-    
     min_price = float("inf")
     for platform_data in price_list:
         sell_price = platform_data.get("sellPrice")
         if isinstance(sell_price, (int, float)) and sell_price > 0 and sell_price < min_price:
             min_price = sell_price
-    
     return min_price if min_price != float("inf") else None
+
 
 def get_batch_item_price(items: List[Dict[str, Any]], chinese_names: List[str]) -> Optional[List[Dict[str, Any]]]:
     """批量饰品价格查询"""
     hash_names = [cn_to_market_hash(items, name) for name in chinese_names if cn_to_market_hash(items, name)]
     if not hash_names:
         return None
-
     try:
         response = requests.post(
             f"{BASE_URL}/price/batch",
@@ -270,26 +332,21 @@ def get_batch_item_price(items: List[Dict[str, Any]], chinese_names: List[str]) 
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            print(f"❌ 批量查询失败: {api_data.get('errorMsg', '未知错误')}")
+            print(f"❌ 批量查询失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 批量请求失败: {str(e)}")
+        print(f"❌ 批量请求失败：{str(e)}")
         return None
 
-# ==================== 【已修复】7天均价查询函数（匹配官方接口规范） ====================
-def get_7day_average_price(market_hash_name: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    查询饰品近7天全平台均价（官方接口路径：/price/avg，GET请求）
-    返回：(数据本体, 错误信息)，成功时错误信息为空
-    """
-    if not market_hash_name:
-        return None, "marketHashName为空"
 
-    # 官方正确接口路径：/price/avg，GET请求，query传参
+# ==================== 7 天均价查询函数 ====================
+def get_7day_average_price(market_hash_name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """查询饰品近 7 天全平台均价"""
+    if not market_hash_name:
+        return None, "marketHashName 为空"
     params = {"marketHashName": market_hash_name}
     try:
         response = requests.get(
@@ -301,20 +358,19 @@ def get_7day_average_price(market_hash_name: str) -> Tuple[Optional[Dict[str, An
         response.raise_for_status()
         api_data = response.json()
     except Exception as e:
-        return None, f"GET请求异常: {str(e)}"
+        return None, f"GET 请求异常：{str(e)}"
 
-    # 处理业务逻辑错误
     if api_data.get("success"):
         return api_data["data"], ""
     else:
-        error_msg = api_data.get("errorMsg", f"接口返回业务错误，完整响应: {json.dumps(api_data, ensure_ascii=False)}")
+        error_msg = api_data.get("errorMsg", f"接口返回业务错误")
         return None, error_msg
+
 
 def get_wear_by_inspect_url(inspect_url: str) -> Optional[Dict[str, Any]]:
     """通过检视链接查询饰品磨损/贴纸数据"""
     if not inspect_url:
         return None
-
     try:
         response = requests.post(
             f"{BASE_URL}/wear/inspect",
@@ -324,21 +380,20 @@ def get_wear_by_inspect_url(inspect_url: str) -> Optional[Dict[str, Any]]:
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            print(f"❌ 磨损查询失败: {api_data.get('errorMsg', '未知错误')}")
+            print(f"❌ 磨损查询失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 网络请求失败: {str(e)}")
+        print(f"❌ 网络请求失败：{str(e)}")
         return None
+
 
 def get_wear_by_asmd(asmd_param: str) -> Optional[Dict[str, Any]]:
-    """通过ASMD参数查询饰品磨损/贴纸数据"""
+    """通过 ASMD 参数查询饰品磨损/贴纸数据"""
     if not asmd_param:
         return None
-
     try:
         response = requests.post(
             f"{BASE_URL}/wear/asm",
@@ -348,21 +403,20 @@ def get_wear_by_asmd(asmd_param: str) -> Optional[Dict[str, Any]]:
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            print(f"❌ 磨损查询失败: {api_data.get('errorMsg', '未知错误')}")
+            print(f"❌ 磨损查询失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 网络请求失败: {str(e)}")
+        print(f"❌ 网络请求失败：{str(e)}")
         return None
+
 
 def generate_preview_image_by_url(inspect_url: str) -> Optional[Dict[str, Any]]:
     """通过检视链接生成饰品检视图"""
     if not inspect_url:
         return None
-
     try:
         response = requests.post(
             f"{BASE_URL}/image/inspect",
@@ -372,21 +426,20 @@ def generate_preview_image_by_url(inspect_url: str) -> Optional[Dict[str, Any]]:
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            print(f"❌ 检视图生成失败: {api_data.get('errorMsg', '未知错误')}")
+            print(f"❌ 检视图生成失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 网络请求失败: {str(e)}")
+        print(f"❌ 网络请求失败：{str(e)}")
         return None
+
 
 def generate_preview_image_by_asmd(asmd_param: str) -> Optional[Dict[str, Any]]:
-    """通过ASMD参数生成饰品检视图"""
+    """通过 ASMD 参数生成饰品检视图"""
     if not asmd_param:
         return None
-
     try:
         response = requests.post(
             f"{BASE_URL}/image/asm",
@@ -396,15 +449,15 @@ def generate_preview_image_by_asmd(asmd_param: str) -> Optional[Dict[str, Any]]:
         )
         response.raise_for_status()
         api_data = response.json()
-
         if api_data.get("success"):
             return api_data["data"]
         else:
-            print(f"❌ 检视图生成失败: {api_data.get('errorMsg', '未知错误')}")
+            print(f"❌ 检视图生成失败：{api_data.get('errorMsg', '未知错误')}")
             return None
     except Exception as e:
-        print(f"❌ 网络请求失败: {str(e)}")
+        print(f"❌ 网络请求失败：{str(e)}")
         return None
+
 
 # ==================== 价格监测核心函数 ====================
 def load_monitor_config() -> List[Dict[str, Any]]:
@@ -417,40 +470,37 @@ def load_monitor_config() -> List[Dict[str, Any]]:
             return []
     return []
 
+
 def save_monitor_config(config: List[Dict[str, Any]]):
     """保存监测配置到本地"""
     with open(MONITOR_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-# ==================== GUI主界面 ====================
+
+# ==================== GUI 主界面 ====================
 class SteamDTTool(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SteamDT CS2饰品全功能工具 | 均价接口修复版")
+        self.title("SteamDT CS2 饰品全功能工具 | 打包数据版")
         self.geometry("1280x800")
         self.resizable(True, True)
 
-        # 基础数据
         self.item_base_data: Optional[List[Dict]] = None
         self.classified_item_data: Optional[List[Dict]] = None
         self.is_loading = False
 
-        # 监测相关属性
         self.monitor_config: List[Dict] = load_monitor_config()
         self.monitor_thread_running = False
         self.monitor_refresh_interval = DEFAULT_REFRESH_INTERVAL
         self.monitor_thread: Optional[threading.Thread] = None
 
-        # 创建标签页
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        # 快速查询标签页
         self.tab_quick_search = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_quick_search, text="🔍 快速查询")
         self.create_quick_search_tab()
 
-        # 原有功能标签页
         self.tab_single = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_single, text="单饰品价格")
         self.create_single_tab()
@@ -460,7 +510,7 @@ class SteamDTTool(tk.Tk):
         self.create_batch_tab()
 
         self.tab_avg = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_avg, text="7天均价")
+        self.notebook.add(self.tab_avg, text="7 天均价")
         self.create_avg_tab()
 
         self.tab_wear = ttk.Frame(self.notebook)
@@ -475,16 +525,13 @@ class SteamDTTool(tk.Tk):
         self.notebook.add(self.tab_monitor, text="价格监测")
         self.create_monitor_tab()
 
-        # 启动时加载饰品基础数据
         threading.Thread(target=self.load_base_data, daemon=True).start()
 
     # ==================== 快速查询页面创建 ====================
     def create_quick_search_tab(self):
-        # 顶部：筛选区
         filter_frame = ttk.LabelFrame(self.tab_quick_search, text="筛选条件")
         filter_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # 筛选条件行
         ttk.Label(filter_frame, text="武器类型:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
         self.weapon_type_combo = ttk.Combobox(filter_frame, state="readonly", width=12)
         self.weapon_type_combo.grid(row=0, column=1, padx=5, pady=8)
@@ -503,31 +550,34 @@ class SteamDTTool(tk.Tk):
         self.search_keyword_input.grid(row=0, column=5, padx=5, pady=8)
         self.search_keyword_input.insert(0, "鹤吻莓")
 
-        ttk.Label(filter_frame, text="监测预警阈值(%):").grid(row=0, column=6, padx=10, pady=8, sticky="w")
+        ttk.Label(filter_frame, text="监测预警阈值 (%):").grid(row=0, column=6, padx=10, pady=8, sticky="w")
         self.quick_threshold_input = ttk.Entry(filter_frame, width=6)
         self.quick_threshold_input.grid(row=0, column=7, padx=5, pady=8)
         self.quick_threshold_input.insert(0, "5")
 
-        # 筛选按钮
         self.search_btn = ttk.Button(filter_frame, text="搜索", command=self.do_filter_items)
         self.search_btn.grid(row=0, column=8, padx=10, pady=8)
         self.reset_filter_btn = ttk.Button(filter_frame, text="重置筛选", command=self.reset_filter)
         self.reset_filter_btn.grid(row=0, column=9, padx=5, pady=8)
 
-        # 绑定回车搜索
+        # 缓存状态和更新按钮
+        self.cache_status_label = ttk.Label(filter_frame, text="⏳ 加载中...", foreground="orange")
+        self.cache_status_label.grid(row=0, column=10, padx=10, pady=8)
+        
+        self.update_data_btn = ttk.Button(filter_frame, text="🔄 更新饰品数据", command=self.manual_update_data)
+        self.update_data_btn.grid(row=0, column=11, padx=5, pady=8)
+        self.update_data_btn.config(state=tk.DISABLED)
+
         self.search_keyword_input.bind("<Return>", lambda event: self.do_filter_items())
 
-        # 中部：结果表格区（支持多选）
-        table_frame = ttk.LabelFrame(self.tab_quick_search, text="筛选结果（按住Ctrl/Shift可多选）")
+        table_frame = ttk.LabelFrame(self.tab_quick_search, text="筛选结果（按住 Ctrl/Shift 可多选）")
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # 表格列定义
         quick_columns = ("item_name", "weapon_type", "wear_level", "market_hash_name")
         self.quick_search_tree = ttk.Treeview(
             table_frame, columns=quick_columns, show="headings", height=18, selectmode="extended"
         )
         
-        # 列标题和宽度
         self.quick_search_tree.heading("item_name", text="饰品中文全称")
         self.quick_search_tree.heading("weapon_type", text="武器类型")
         self.quick_search_tree.heading("wear_level", text="磨损度")
@@ -538,11 +588,9 @@ class SteamDTTool(tk.Tk):
         self.quick_search_tree.column("wear_level", width=90)
         self.quick_search_tree.column("market_hash_name", width=550)
 
-        # 表格样式
         self.quick_search_tree.tag_configure("even", background="#f5f5f5")
         self.quick_search_tree.tag_configure("odd", background="#ffffff")
 
-        # 滚动条
         quick_tree_y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.quick_search_tree.yview)
         quick_tree_x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.quick_search_tree.xview)
         self.quick_search_tree.configure(yscrollcommand=quick_tree_y_scroll.set, xscrollcommand=quick_tree_x_scroll.set)
@@ -551,18 +599,15 @@ class SteamDTTool(tk.Tk):
         quick_tree_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.quick_search_tree.pack(fill=tk.BOTH, expand=True)
 
-        # 绑定双击事件（快速查价格）
         self.quick_search_tree.bind("<Double-1>", self.on_quick_item_double_click)
 
-        # 底部：核心操作按钮区
         action_frame = ttk.Frame(self.tab_quick_search)
         action_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        # 核心操作按钮
         self.quick_query_price_btn = ttk.Button(action_frame, text="查询单饰品价格", command=self.quick_query_price)
         self.quick_query_price_btn.pack(side=tk.LEFT, padx=5)
 
-        self.quick_query_avg_btn = ttk.Button(action_frame, text="查询7日均价", command=self.quick_query_7day_avg)
+        self.quick_query_avg_btn = ttk.Button(action_frame, text="查询 7 日均价", command=self.quick_query_7day_avg)
         self.quick_query_avg_btn.pack(side=tk.LEFT, padx=5)
 
         self.quick_add_batch_btn = ttk.Button(action_frame, text="添加到批量查询", command=self.quick_add_to_batch)
@@ -571,14 +616,12 @@ class SteamDTTool(tk.Tk):
         self.quick_add_monitor_btn = ttk.Button(action_frame, text="添加到价格监测", command=self.quick_add_to_monitor)
         self.quick_add_monitor_btn.pack(side=tk.LEFT, padx=5)
 
-        # 辅助操作按钮
         self.quick_copy_name_btn = ttk.Button(action_frame, text="复制饰品名称", command=self.quick_copy_item_name)
         self.quick_copy_name_btn.pack(side=tk.LEFT, padx=5)
 
-        self.quick_copy_hash_btn = ttk.Button(action_frame, text="复制marketHashName", command=self.quick_copy_hash_name)
+        self.quick_copy_hash_btn = ttk.Button(action_frame, text="复制 marketHashName", command=self.quick_copy_hash_name)
         self.quick_copy_hash_btn.pack(side=tk.LEFT, padx=5)
 
-        # 操作日志区
         log_frame = ttk.LabelFrame(self.tab_quick_search, text="操作日志")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.quick_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=5)
@@ -586,7 +629,6 @@ class SteamDTTool(tk.Tk):
 
     # ==================== 快速查询相关方法 ====================
     def append_quick_log(self, text: str):
-        """追加快速查询日志"""
         def _append():
             self.quick_log.config(state=tk.NORMAL)
             self.quick_log.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
@@ -595,7 +637,6 @@ class SteamDTTool(tk.Tk):
         self.after(0, _append)
 
     def get_selected_quick_items(self) -> List[Dict[str, Any]]:
-        """获取选中的所有饰品数据，支持多选"""
         selected_items = self.quick_search_tree.selection()
         if not selected_items:
             messagebox.showwarning("提示", "请先选中表格中的饰品")
@@ -612,7 +653,6 @@ class SteamDTTool(tk.Tk):
         return result
 
     def do_filter_items(self):
-        """执行筛选操作"""
         if not self.classified_item_data:
             messagebox.showwarning("提示", "饰品基础数据尚未加载完成，请稍候")
             return
@@ -628,11 +668,9 @@ class SteamDTTool(tk.Tk):
             keyword=keyword
         )
 
-        # 清空表格
         for item in self.quick_search_tree.get_children():
             self.quick_search_tree.delete(item)
 
-        # 插入结果
         for idx, item in enumerate(filtered_list):
             tag = "even" if idx % 2 == 0 else "odd"
             self.quick_search_tree.insert("", tk.END, values=(
@@ -645,7 +683,6 @@ class SteamDTTool(tk.Tk):
         self.append_quick_log(f"✅ 筛选完成，共找到 {len(filtered_list)} 个符合条件的饰品")
 
     def reset_filter(self):
-        """重置筛选条件"""
         self.weapon_type_combo.current(0)
         self.wear_level_combo.current(0)
         self.search_keyword_input.delete(0, tk.END)
@@ -654,51 +691,77 @@ class SteamDTTool(tk.Tk):
         self.do_filter_items()
 
     def on_quick_item_double_click(self, event):
-        """双击表格行直接查询单饰品价格"""
         self.quick_query_price()
+
+    # ==================== 手动更新数据功能 ====================
+    def manual_update_data(self):
+        """手动触发饰品数据更新"""
+        if self.is_loading:
+            messagebox.showwarning("提示", "数据正在加载中，请稍候")
+            return
+        
+        if not messagebox.askyesno("确认", "确定要更新饰品数据吗？\n\n注意：\n1. 每日只能成功调用 1 次 API\n2. 更新过程可能需要几秒到几十秒\n3. 更新失败会自动使用旧数据"):
+            return
+        
+        self.update_data_btn.config(state=tk.DISABLED)
+        self.cache_status_label.config(text="🔄 更新中...", foreground="orange")
+        self.append_quick_log("🔄 开始手动更新饰品数据...")
+        
+        threading.Thread(target=self._manual_update_logic, daemon=True).start()
+
+    def _manual_update_logic(self):
+        """后台执行数据更新"""
+        raw_data = get_steam_items(force_refresh=True)
+        
+        if raw_data:
+            self.item_base_data = raw_data
+            self.classified_item_data = init_item_classify_data(raw_data)
+            self.after(0, lambda: self.append_quick_log(f"✅ 饰品数据更新成功，共 {len(self.classified_item_data)} 个饰品"))
+            self.after(0, lambda: self.cache_status_label.config(text="✅ 已更新", foreground="green"))
+            self.after(0, self.do_filter_items)
+        else:
+            self.after(0, lambda: self.append_quick_log("❌ 饰品数据更新失败，继续使用旧数据"))
+            self.after(0, lambda: self.cache_status_label.config(text="⚠️ 使用旧数据", foreground="orange"))
+            messagebox.showwarning("提示", "数据更新失败，将继续使用旧数据\n\n可能原因：\n1. 网络问题\n2. API 调用次数已达上限\n3. API_KEY 无效")
+        
+        self.after(0, lambda: self.update_data_btn.config(state=tk.NORMAL))
 
     # ==================== 核心操作按钮实现 ====================
     def quick_query_price(self):
-        """查询选中饰品的单饰品价格（单选）"""
         selected_items = self.get_selected_quick_items()
         if not selected_items:
             return
         if len(selected_items) > 1:
-            messagebox.showwarning("提示", "单饰品价格查询仅支持选中1个饰品")
+            messagebox.showwarning("提示", "单饰品价格查询仅支持选中 1 个饰品")
             return
         
         selected_item = selected_items[0]
         item_name = selected_item["name"]
-        # 切换页面并自动查询
         self.notebook.select(self.tab_single)
         self.single_input.delete(0, tk.END)
         self.single_input.insert(0, item_name)
         self.query_single_price()
 
     def quick_query_7day_avg(self):
-        """查询选中饰品的7日均价（单选）"""
         selected_items = self.get_selected_quick_items()
         if not selected_items:
             return
         if len(selected_items) > 1:
-            messagebox.showwarning("提示", "7日均价查询仅支持选中1个饰品")
+            messagebox.showwarning("提示", "7 日均价查询仅支持选中 1 个饰品")
             return
         
         selected_item = selected_items[0]
         item_name = selected_item["name"]
-        # 切换页面并自动查询
         self.notebook.select(self.tab_avg)
         self.avg_input.delete(0, tk.END)
         self.avg_input.insert(0, item_name)
         self.query_avg_price()
 
     def quick_add_to_batch(self):
-        """将选中的饰品添加到批量查询列表（多选）"""
         selected_items = self.get_selected_quick_items()
         if not selected_items:
             return
         
-        # 获取当前批量输入框内容，去重追加
         current_text = self.batch_input.get().strip()
         current_names = [name.strip() for name in current_text.split(",") if name.strip()]
         new_names = []
@@ -709,7 +772,6 @@ class SteamDTTool(tk.Tk):
                 current_names.append(item_name)
                 new_names.append(item_name)
         
-        # 更新输入框
         self.batch_input.delete(0, tk.END)
         self.batch_input.insert(0, ", ".join(current_names))
         
@@ -717,7 +779,6 @@ class SteamDTTool(tk.Tk):
         self.notebook.select(self.tab_batch)
 
     def quick_add_to_monitor(self):
-        """将选中的饰品添加到价格监测（多选，后台线程执行）"""
         if self.is_loading or not self.item_base_data:
             messagebox.showwarning("提示", "饰品基础数据尚未加载完成")
             return
@@ -726,20 +787,15 @@ class SteamDTTool(tk.Tk):
         if not selected_items:
             return
         
-        # 后台线程执行，避免UI卡死
         threading.Thread(target=self._quick_add_monitor_logic, args=(selected_items,), daemon=True).start()
 
     def _quick_add_monitor_logic(self, selected_items: List[Dict]):
-        """批量添加监测的后台逻辑"""
-        # 校验阈值
         try:
             threshold = float(self.quick_threshold_input.get().strip())
             if threshold <= 0:
                 threshold = 5
         except:
             threshold = 5
-            self.after(0, lambda: self.quick_threshold_input.delete(0, tk.END))
-            self.after(0, lambda: self.quick_threshold_input.insert(0, "5"))
         
         success_count = 0
         skip_count = 0
@@ -752,20 +808,17 @@ class SteamDTTool(tk.Tk):
             item_name = selected_item["name"]
             hash_name = selected_item["marketHashName"]
 
-            # 检查是否已存在
             for item in self.monitor_config:
                 if item["name"] == item_name:
                     skip_count += 1
                     continue
 
-            # 获取初始价格
             init_price = get_item_min_price(hash_name)
             if not init_price:
                 fail_count += 1
-                self.after(0, lambda n=item_name: self.append_quick_log(f"❌ 【{n}】初始价格获取失败，跳过"))
+                self.after(0, lambda n=item_name: self.append_quick_log(f"❌【{n}】初始价格获取失败，跳过"))
                 continue
 
-            # 添加到监测配置
             new_monitor_item = {
                 "name": item_name,
                 "market_hash_name": hash_name,
@@ -778,15 +831,12 @@ class SteamDTTool(tk.Tk):
             self.monitor_config.append(new_monitor_item)
             success_count += 1
 
-        # 保存配置并更新UI
         save_monitor_config(self.monitor_config)
         self.after(0, self.update_monitor_table)
-        self.after(0, lambda: self.append_quick_log(f"✅ 批量添加完成：成功{success_count}个，跳过{skip_count}个（已存在），失败{fail_count}个"))
-        self.after(0, lambda: messagebox.showinfo("完成", f"批量添加监测完成\n成功：{success_count}个\n跳过：{skip_count}个（已存在）\n失败：{fail_count}个"))
+        self.after(0, lambda: self.append_quick_log(f"✅ 批量添加完成：成功{success_count}个，跳过{skip_count}个，失败{fail_count}个"))
+        self.after(0, lambda: messagebox.showinfo("完成", f"批量添加监测完成\n成功：{success_count}个\n跳过：{skip_count}个\n失败：{fail_count}个"))
 
-    # ==================== 复制功能（支持多选） ====================
     def quick_copy_item_name(self):
-        """复制选中饰品的中文名称，多选逗号分隔"""
         selected_items = self.get_selected_quick_items()
         if not selected_items:
             return
@@ -798,7 +848,6 @@ class SteamDTTool(tk.Tk):
         self.append_quick_log(f"✅ 已复制 {len(names)} 个饰品名称")
 
     def quick_copy_hash_name(self):
-        """复制选中饰品的marketHashName，多选换行分隔"""
         selected_items = self.get_selected_quick_items()
         if not selected_items:
             return
@@ -807,45 +856,39 @@ class SteamDTTool(tk.Tk):
         copy_text = "\n".join(hash_names)
         self.clipboard_clear()
         self.clipboard_append(copy_text)
-        self.append_quick_log(f"✅ 已复制 {len(hash_names)} 个marketHashName")
+        self.append_quick_log(f"✅ 已复制 {len(hash_names)} 个 marketHashName")
 
-    # ==================== 原有页面创建 ====================
+    # ==================== 原有页面创建（省略重复代码，保持原有逻辑） ====================
     def create_single_tab(self):
         input_frame = ttk.Frame(self.tab_single)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
-
         ttk.Label(input_frame, text="饰品中文全称:").pack(side=tk.LEFT, padx=5)
         self.single_input = ttk.Entry(input_frame, width=50)
         self.single_input.pack(side=tk.LEFT, padx=5)
         self.single_input.insert(0, "AK-47 | 红线 (略有磨损)")
         ttk.Button(input_frame, text="查询价格", command=self.query_single_price).pack(side=tk.LEFT, padx=5)
-
         self.single_result = scrolledtext.ScrolledText(self.tab_single, wrap=tk.WORD, state=tk.DISABLED)
         self.single_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     def create_batch_tab(self):
         input_frame = ttk.Frame(self.tab_batch)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
-
         ttk.Label(input_frame, text="饰品名称（中文，逗号分隔）:").pack(side=tk.LEFT, padx=5)
         self.batch_input = ttk.Entry(input_frame, width=70)
         self.batch_input.pack(side=tk.LEFT, padx=5)
         self.batch_input.insert(0, "AWP | 二西莫夫 (久经沙场), M4A1-S | 氮化处理 (崭新出厂)")
         ttk.Button(input_frame, text="批量查询", command=self.query_batch_price).pack(side=tk.LEFT, padx=5)
-
         self.batch_result = scrolledtext.ScrolledText(self.tab_batch, wrap=tk.WORD, state=tk.DISABLED)
         self.batch_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     def create_avg_tab(self):
         input_frame = ttk.Frame(self.tab_avg)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
-
         ttk.Label(input_frame, text="饰品中文全称:").pack(side=tk.LEFT, padx=5)
         self.avg_input = ttk.Entry(input_frame, width=50)
         self.avg_input.pack(side=tk.LEFT, padx=5)
         self.avg_input.insert(0, "AK-47 | 红线 (略有磨损)")
-        ttk.Button(input_frame, text="查询7天均价", command=self.query_avg_price).pack(side=tk.LEFT, padx=5)
-
+        ttk.Button(input_frame, text="查询 7 天均价", command=self.query_avg_price).pack(side=tk.LEFT, padx=5)
         self.avg_result = scrolledtext.ScrolledText(self.tab_avg, wrap=tk.WORD, state=tk.DISABLED)
         self.avg_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
@@ -856,14 +899,12 @@ class SteamDTTool(tk.Tk):
         self.wear_url_input = ttk.Entry(url_frame, width=80)
         self.wear_url_input.pack(side=tk.LEFT, padx=5)
         ttk.Button(url_frame, text="查询磨损", command=self.query_wear_by_url).pack(side=tk.LEFT, padx=5)
-
         asmd_frame = ttk.Frame(self.tab_wear)
         asmd_frame.pack(fill=tk.X, padx=10, pady=8)
-        ttk.Label(asmd_frame, text="ASMD参数:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(asmd_frame, text="ASMD 参数:").pack(side=tk.LEFT, padx=5)
         self.wear_asmd_input = ttk.Entry(asmd_frame, width=80)
         self.wear_asmd_input.pack(side=tk.LEFT, padx=5)
         ttk.Button(asmd_frame, text="查询磨损", command=self.query_wear_by_asmd).pack(side=tk.LEFT, padx=5)
-
         self.wear_result = scrolledtext.ScrolledText(self.tab_wear, wrap=tk.WORD, state=tk.DISABLED)
         self.wear_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
@@ -874,54 +915,43 @@ class SteamDTTool(tk.Tk):
         self.image_url_input = ttk.Entry(url_frame, width=80)
         self.image_url_input.pack(side=tk.LEFT, padx=5)
         ttk.Button(url_frame, text="生成检视图", command=self.gen_image_by_url).pack(side=tk.LEFT, padx=5)
-
         asmd_frame = ttk.Frame(self.tab_image)
         asmd_frame.pack(fill=tk.X, padx=10, pady=8)
-        ttk.Label(asmd_frame, text="ASMD参数:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(asmd_frame, text="ASMD 参数:").pack(side=tk.LEFT, padx=5)
         self.image_asmd_input = ttk.Entry(asmd_frame, width=80)
         self.image_asmd_input.pack(side=tk.LEFT, padx=5)
         ttk.Button(asmd_frame, text="生成检视图", command=self.gen_image_by_asmd).pack(side=tk.LEFT, padx=5)
-
         self.image_result = scrolledtext.ScrolledText(self.tab_image, wrap=tk.WORD, state=tk.DISABLED)
         self.image_result.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     def create_monitor_tab(self):
         add_frame = ttk.LabelFrame(self.tab_monitor, text="添加监测饰品")
         add_frame.pack(fill=tk.X, padx=10, pady=5)
-
         ttk.Label(add_frame, text="饰品中文全称:").grid(row=0, column=0, padx=5, pady=8, sticky="w")
         self.monitor_add_input = ttk.Entry(add_frame, width=40)
         self.monitor_add_input.grid(row=0, column=1, padx=5, pady=8)
         self.monitor_add_input.insert(0, "AK-47 | 红线 (略有磨损)")
-
-        ttk.Label(add_frame, text="涨跌预警阈值(%):").grid(row=0, column=2, padx=5, pady=8, sticky="w")
+        ttk.Label(add_frame, text="涨跌预警阈值 (%):").grid(row=0, column=2, padx=5, pady=8, sticky="w")
         self.monitor_threshold_input = ttk.Entry(add_frame, width=10)
         self.monitor_threshold_input.grid(row=0, column=3, padx=5, pady=8)
         self.monitor_threshold_input.insert(0, "5")
-
         ttk.Button(add_frame, text="添加到监测", command=self.add_monitor_item).grid(row=0, column=4, padx=10, pady=8)
 
         control_frame = ttk.Frame(self.tab_monitor)
         control_frame.pack(fill=tk.X, padx=10, pady=5)
-
         self.refresh_btn = ttk.Button(control_frame, text="手动刷新全部", command=self.manual_refresh_monitor)
         self.refresh_btn.pack(side=tk.LEFT, padx=5)
-
         self.auto_refresh_btn = ttk.Button(control_frame, text="开启自动刷新", command=self.toggle_auto_refresh)
         self.auto_refresh_btn.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(control_frame, text="刷新间隔(秒):").pack(side=tk.LEFT, padx=10)
+        ttk.Label(control_frame, text="刷新间隔 (秒):").pack(side=tk.LEFT, padx=10)
         self.interval_input = ttk.Entry(control_frame, width=8)
         self.interval_input.pack(side=tk.LEFT, padx=5)
         self.interval_input.insert(0, str(DEFAULT_REFRESH_INTERVAL))
-
         self.clear_btn = ttk.Button(control_frame, text="清空监测列表", command=self.clear_monitor)
         self.clear_btn.pack(side=tk.RIGHT, padx=5)
 
-        # 监测表格
         table_frame = ttk.Frame(self.tab_monitor)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
         columns = ("name", "current_price", "last_price", "change_amount", "change_rate", "init_price", "total_change", "update_time")
         self.monitor_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=15)
         
@@ -956,27 +986,29 @@ class SteamDTTool(tk.Tk):
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.monitor_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=6)
         self.monitor_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
         self.update_monitor_table()
 
     # ==================== 原有工具方法 ====================
     def load_base_data(self):
-        """加载饰品基础数据并预分类"""
         self.is_loading = True
-        self.append_log("正在加载饰品基础数据（每日仅1次）...", "single")
+        self.append_log("正在加载饰品基础数据...", "single")
         self.append_quick_log("🔄 正在加载饰品基础数据...")
 
-        raw_data = get_steam_items()
+        raw_data = get_steam_items(force_refresh=False)
         if raw_data:
             self.item_base_data = raw_data
             self.classified_item_data = init_item_classify_data(raw_data)
             self.append_log(f"✅ 加载完成，共 {len(self.item_base_data)} 个饰品", "single")
-            self.append_quick_log(f"✅ 饰品数据加载完成，共 {len(self.classified_item_data)} 个饰品，可开始筛选")
+            self.append_quick_log(f"✅ 饰品数据加载完成，共 {len(self.classified_item_data)} 个饰品")
+            self.after(0, lambda: self.cache_status_label.config(text="✅ 就绪", foreground="green"))
+            self.after(0, lambda: self.update_data_btn.config(state=tk.NORMAL))
             self.after(0, self.do_filter_items)
         else:
-            self.append_log("❌ 加载失败，请检查API_KEY和网络", "single")
-            self.append_quick_log("❌ 饰品数据加载失败，请检查API_KEY和网络")
-            messagebox.showerror("错误", "饰品基础数据加载失败！")
+            self.append_log("❌ 加载失败，请检查 API_KEY 和网络", "single")
+            self.append_quick_log("❌ 饰品数据加载失败，请检查 API_KEY 和网络")
+            self.after(0, lambda: self.cache_status_label.config(text="❌ 失败", foreground="red"))
+            self.after(0, lambda: self.update_data_btn.config(state=tk.NORMAL))
+            messagebox.showerror("错误", "饰品基础数据加载失败！\n\n请确保：\n1. 网络连接正常\n2. API_KEY 有效\n3. 本地有缓存文件")
 
         self.is_loading = False
 
@@ -992,7 +1024,6 @@ class SteamDTTool(tk.Tk):
             widget = text_widget_map.get(tab)
             if not widget:
                 return
-
             widget.config(state=tk.NORMAL)
             widget.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {text}{end}")
             widget.config(state=tk.DISABLED)
@@ -1008,7 +1039,6 @@ class SteamDTTool(tk.Tk):
         self.after(0, _append)
 
     def update_monitor_table(self):
-        """更新监测表格，实时显示刷新时间"""
         for item in self.monitor_tree.get_children():
             self.monitor_tree.delete(item)
         for monitor_item in self.monitor_config:
@@ -1075,16 +1105,15 @@ class SteamDTTool(tk.Tk):
         self.monitor_config.append(new_monitor_item)
         save_monitor_config(self.monitor_config)
         self.update_monitor_table()
-        self.append_monitor_log(f"✅ 成功添加【{cn_name}】，初始价格: {init_price:.2f}")
+        self.append_monitor_log(f"✅ 成功添加【{cn_name}】，初始价格：{init_price:.2f}")
         self.monitor_add_input.delete(0, tk.END)
 
     def refresh_all_monitor(self):
-        """刷新全部监测饰品价格，每次刷新更新时间戳"""
         if not self.monitor_config:
             self.append_monitor_log("监测列表为空，无需刷新")
             return
         refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.append_monitor_log(f"🔄 开始刷新全部监测饰品，共 {len(self.monitor_config)} 个，刷新时间：{refresh_time}")
+        self.append_monitor_log(f"🔄 开始刷新全部监测饰品，共 {len(self.monitor_config)} 个")
         alert_list = []
 
         for monitor_item in self.monitor_config:
@@ -1093,23 +1122,21 @@ class SteamDTTool(tk.Tk):
             threshold = monitor_item["threshold"]
             new_price = get_item_min_price(hash_name)
             if not new_price:
-                self.append_monitor_log(f"⚠️  【{name}】价格刷新失败")
+                self.append_monitor_log(f"⚠️【{name}】价格刷新失败")
                 continue
-            # 更新价格和刷新时间
             old_last_price = monitor_item["last_price"]
             monitor_item["last_price"] = monitor_item["current_price"]
             monitor_item["current_price"] = new_price
             monitor_item["update_time"] = refresh_time
-            # 计算涨跌幅
             change_rate = ((new_price - old_last_price) / old_last_price) * 100 if old_last_price > 0 else 0
             if abs(change_rate) >= threshold:
-                alert_list.append(f"【{name}】 涨跌幅: {change_rate:+.2f}%，当前价格: {new_price:.2f}")
+                alert_list.append(f"【{name}】涨跌幅：{change_rate:+.2f}%，当前价格：{new_price:.2f}")
 
         save_monitor_config(self.monitor_config)
         self.after(0, self.update_monitor_table)
-        self.append_monitor_log(f"✅ 全部饰品刷新完成，刷新时间：{refresh_time}")
+        self.append_monitor_log(f"✅ 全部饰品刷新完成")
         if alert_list:
-            alert_msg = "⚠️  涨跌预警提醒:\n" + "\n".join(alert_list)
+            alert_msg = "⚠️ 涨跌预警提醒:\n" + "\n".join(alert_list)
             self.append_monitor_log(alert_msg)
             self.after(0, lambda: messagebox.showwarning("价格涨跌预警", alert_msg))
 
@@ -1124,7 +1151,7 @@ class SteamDTTool(tk.Tk):
             try:
                 self.refresh_all_monitor()
             except Exception as e:
-                self.append_monitor_log(f"❌ 自动刷新异常: {str(e)}")
+                self.append_monitor_log(f"❌ 自动刷新异常：{str(e)}")
             for _ in range(self.monitor_refresh_interval):
                 if not self.monitor_thread_running:
                     break
@@ -1138,13 +1165,13 @@ class SteamDTTool(tk.Tk):
             try:
                 interval = int(self.interval_input.get().strip())
                 if interval < 60:
-                    messagebox.showwarning("提示", "刷新间隔最小60秒，已自动设置为60秒")
+                    messagebox.showwarning("提示", "刷新间隔最小 60 秒，已自动设置为 60 秒")
                     interval = 60
                     self.interval_input.delete(0, tk.END)
                     self.interval_input.insert(0, "60")
                 self.monitor_refresh_interval = interval
             except:
-                messagebox.showwarning("提示", "刷新间隔格式错误，使用默认值300秒")
+                messagebox.showwarning("提示", "刷新间隔格式错误，使用默认值 300 秒")
                 self.monitor_refresh_interval = DEFAULT_REFRESH_INTERVAL
                 self.interval_input.delete(0, tk.END)
                 self.interval_input.insert(0, str(DEFAULT_REFRESH_INTERVAL))
@@ -1152,7 +1179,7 @@ class SteamDTTool(tk.Tk):
             self.monitor_thread = threading.Thread(target=self.auto_refresh_loop, daemon=True)
             self.monitor_thread.start()
             self.auto_refresh_btn.config(text="关闭自动刷新")
-            self.append_monitor_log(f"✅ 自动刷新已开启，刷新间隔: {self.monitor_refresh_interval}秒")
+            self.append_monitor_log(f"✅ 自动刷新已开启，刷新间隔：{self.monitor_refresh_interval}秒")
         else:
             self.monitor_thread_running = False
             self.auto_refresh_btn.config(text="开启自动刷新")
@@ -1164,7 +1191,7 @@ class SteamDTTool(tk.Tk):
         self.monitor_config = []
         save_monitor_config(self.monitor_config)
         self.update_monitor_table()
-        self.append_monitor_log("🗑️  监测列表已清空")
+        self.append_monitor_log("🗑️ 监测列表已清空")
 
     # ==================== 原有业务逻辑 ====================
     def query_single_price(self):
@@ -1186,7 +1213,7 @@ class SteamDTTool(tk.Tk):
         if not hash_name:
             self.append_log("❌ 未找到该饰品，请检查名称和磨损度是否完全匹配", "single")
             return
-        self.append_log(f"✅ 匹配marketHashName: {hash_name}", "single")
+        self.append_log(f"✅ 匹配 marketHashName: {hash_name}", "single")
         price_list = get_single_item_price(hash_name)
         if not price_list:
             self.append_log("❌ 价格查询失败", "single")
@@ -1199,12 +1226,12 @@ class SteamDTTool(tk.Tk):
             sell_price = platform_data.get("sellPrice", "未知")
             sell_count = platform_data.get("sellCount", 0)
             bidding_price = platform_data.get("biddingPrice", "未知")
-            self.append_log(f"  【{platform}】 在售价格: {sell_price} | 在售数量: {sell_count} | 求购价格: {bidding_price}", "single")
+            self.append_log(f"  【{platform}】在售价格：{sell_price} | 在售数量：{sell_count} | 求购价格：{bidding_price}", "single")
             if isinstance(sell_price, (int, float)) and sell_price < min_price:
                 min_price = sell_price
                 min_platform = platform
         if min_platform:
-            self.append_log(f"💡 全网最低: {min_price} （{min_platform}）", "single")
+            self.append_log(f"💡 全网最低：{min_price}（{min_platform}）", "single")
 
     def query_batch_price(self):
         if self.is_loading:
@@ -1229,13 +1256,12 @@ class SteamDTTool(tk.Tk):
         for item in batch_data:
             hash_name = item.get("marketHashName", "未知")
             platform_list = item.get("dataList", [])
-            self.append_log(f"\n📦 饰品: {hash_name}", "batch")
+            self.append_log(f"\n📦 饰品：{hash_name}", "batch")
             for platform_data in platform_list:
                 platform = platform_data.get("platform", "未知")
                 price = platform_data.get("sellPrice", "未知")
-                self.append_log(f"  【{platform}】 {price}", "batch")
+                self.append_log(f"  【{platform}】{price}", "batch")
 
-    # ==================== 7天均价查询业务逻辑 ====================
     def query_avg_price(self):
         if self.is_loading:
             messagebox.showwarning("提示", "请等待基础数据加载完成")
@@ -1250,26 +1276,22 @@ class SteamDTTool(tk.Tk):
         threading.Thread(target=self._query_avg_logic, args=(cn_name,), daemon=True).start()
 
     def _query_avg_logic(self, cn_name: str):
-        self.append_log(f"\n===== 7天均价查询：{cn_name} =====", "avg")
+        self.append_log(f"\n===== 7 天均价查询：{cn_name} =====", "avg")
         hash_name = cn_to_market_hash(self.item_base_data, cn_name)
         if not hash_name:
             self.append_log("❌ 未找到该饰品，请检查名称和磨损度是否完全匹配", "avg")
             return
-        self.append_log(f"✅ 匹配marketHashName: {hash_name}", "avg")
-        
-        # 调用修复后的均价查询函数
+        self.append_log(f"✅ 匹配 marketHashName: {hash_name}", "avg")
         avg_data, error_msg = get_7day_average_price(hash_name)
         if not avg_data:
             self.append_log(f"❌ 均价查询失败，原因：{error_msg}", "avg")
             return
-        
-        # 解析并展示均价数据
-        self.append_log(f"✅ 查询成功，全平台近7天均价: {avg_data.get('avgPrice', '未知')}", "avg")
-        self.append_log("📊 各平台近7天均价：", "avg")
+        self.append_log(f"✅ 查询成功，全平台近 7 天均价：{avg_data.get('avgPrice', '未知')}", "avg")
+        self.append_log("📊 各平台近 7 天均价：", "avg")
         for platform_data in avg_data.get("dataList", []):
             platform = platform_data.get("platform", "未知平台")
             avg_price = platform_data.get("avgPrice", "未知")
-            self.append_log(f"  【{platform}】 近7天均价: {avg_price}", "avg")
+            self.append_log(f"  【{platform}】近 7 天均价：{avg_price}", "avg")
 
     def query_wear_by_url(self):
         url = self.wear_url_input.get().strip()
@@ -1289,12 +1311,12 @@ class SteamDTTool(tk.Tk):
     def query_wear_by_asmd(self):
         asmd = self.wear_asmd_input.get().strip()
         if not asmd:
-            messagebox.showwarning("提示", "请输入ASMD参数")
+            messagebox.showwarning("提示", "请输入 ASMD 参数")
             return
         threading.Thread(target=self._wear_asmd_logic, args=(asmd,), daemon=True).start()
 
     def _wear_asmd_logic(self, asmd: str):
-        self.append_log(f"\n===== ASMD磨损查询 =====", "wear")
+        self.append_log(f"\n===== ASMD 磨损查询 =====", "wear")
         wear_data = get_wear_by_asmd(asmd)
         if not wear_data:
             self.append_log("❌ 查询失败", "wear")
@@ -1319,17 +1341,18 @@ class SteamDTTool(tk.Tk):
     def gen_image_by_asmd(self):
         asmd = self.image_asmd_input.get().strip()
         if not asmd:
-            messagebox.showwarning("提示", "请输入ASMD参数")
+            messagebox.showwarning("提示", "请输入 ASMD 参数")
             return
         threading.Thread(target=self._image_asmd_logic, args=(asmd,), daemon=True).start()
 
     def _image_asmd_logic(self, asmd: str):
-        self.append_log(f"\n===== ASMD生成检视图 =====", "image")
+        self.append_log(f"\n===== ASMD 生成检视图 =====", "image")
         image_data = generate_preview_image_by_asmd(asmd)
         if not image_data:
             self.append_log("❌ 生成失败", "image")
             return
         self.append_log(json.dumps(image_data, ensure_ascii=False, indent=2), "image")
+
 
 # ==================== 程序入口 ====================
 if __name__ == "__main__":
